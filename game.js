@@ -1571,4 +1571,6 @@ Game.updateBoard();
 const QS = new URLSearchParams(location.search);
 if (QS.get('hud') === '0') document.body.classList.add('shot');
 window.__gameBooted = true;
+startMatch();
+$('loader').classList.add('hidden');
 loop();
