@@ -119,7 +119,6 @@ const Input = {
       if (e.key.toLowerCase() === 'k' || e.key.toLowerCase() === 'l') Game.onLobButton();
       if (e.key.toLowerCase() === 'p' || e.key === 'Escape') Game.togglePause();
       if (e.key.toLowerCase() === 'm') Game.toggleMute();
-      if (e.key === 'Enter' && !$('menu').classList.contains('hidden')) Game.startFromMenu();
     });
     addEventListener('keyup', e => {
       this.keys[e.key.toLowerCase()] = false;
@@ -938,7 +937,7 @@ function clearShot(from, target, T0, clearance) {
 
 // ---------- game state ----------
 const Game = {
-  mode: 'menu', paused: false, over: false,
+  mode: 'serve', paused: false, over: false,
   server: NEAR, pointIndex: 0, faults: 0,
   pts: { [NEAR]: 0, [FAR]: 0 }, games: { [NEAR]: 0, [FAR]: 0 },
   rally: 0, best: 0, topSpeed: 0, perfects: 0, aces: 0,
@@ -966,19 +965,21 @@ const Game = {
     trailPts.length = 0;
     $('rally').textContent = 'RALLY 0';
   },
-  startFromMenu() {
-    SFX.init(); SFX.click();
-    document.body.classList.remove('menu');
-    $('menu').classList.add('hidden');
-    this.startMatch();
-  },
   startMatch() {
     this.pts[NEAR] = this.pts[FAR] = 0;
     this.games[NEAR] = this.games[FAR] = 0;
     this.pointIndex = 0; this.faults = 0; this.server = NEAR;
     this.over = false; this.diff = 0.45;
     this.rally = 0; this.best = 0; this.topSpeed = 0; this.perfects = 0; this.aces = 0;
-    $('endOv').classList.add('hidden');
+    this.updateBoard();
+    this.nextPoint(true);
+  }
+  startMatch() {
+    this.pts[NEAR] = this.pts[FAR] = 0;
+    this.games[NEAR] = this.games[FAR] = 0;
+    this.pointIndex = 0; this.faults = 0; this.server = NEAR;
+    this.over = false; this.diff = 0.45;
+    this.rally = 0; this.best = 0; this.topSpeed = 0; this.perfects = 0; this.aces = 0;
     this.updateBoard();
     this.nextPoint(true);
   },
@@ -992,13 +993,7 @@ const Game = {
     ball.pos.set(r.pos.x, 1.3, r.pos.z - (this.server === NEAR ? 0.4 : -0.4));
     ball.vel.set(0, 0, 0);
     if (this.server === NEAR) {
-      this.sub(this.pointIndex === 0 && first
-        ? 'SPACE / HIT to toss — strike at the peak! ← → aims'
-        : 'Your serve — toss, then strike at the peak!', 4);
-      this.msg(this.pointIndex === 0 && first ? 'YOUR SERVE' : '', '', 1.2);
     } else {
-      this.sub('Rival serving — get ready!', 2.5);
-      this.msg('RIVAL SERVES', '', 1.2);
       this.ai.serveT = rand(1.0, 1.6);
     }
   },
@@ -1048,14 +1043,13 @@ const Game = {
       this.updateBoard();
       SFX.whistle(w === NEAR);
       if (this.games[w] >= WIN_GAMES) return this.matchOver(w);
-      this.msg(w === NEAR ? 'GAME — YOU!' : 'GAME — RIVAL', `Games ${this.games[NEAR]} — ${this.games[FAR]}`, 2.4);
+      // Removed msg() call - no helper text display
       SFX.chime(w === NEAR);
       setTimeout(() => { if (!this.over) { this.nextPoint(); } }, 2500);
     } else {
       this.pointIndex++;
       this.updateBoard();
-      const deuce = this.pts[NEAR] >= 3 && this.pts[FAR] >= 3 && this.pts[NEAR] === this.pts[FAR];
-      this.msg(big || reason, deuce ? 'DEUCE' : '', 1.8);
+      // Removed msg() call - no helper text display
       if (w === NEAR) SFX.whistle(true);
       setTimeout(() => { if (!this.over && this.mode === 'point') this.nextPoint(); }, 2000);
     }
@@ -1069,31 +1063,9 @@ const Game = {
       camShake = 0.35;
     }
     SFX.chime(w === NEAR); SFX.whistle(w === NEAR);
-    $('endTitle').textContent = w === NEAR ? 'VICTORY ✨' : 'RIVAL WINS';
-    $('endScore').textContent = `${this.games[NEAR]} — ${this.games[FAR]}`;
-    $('endStats').innerHTML =
-      `<div><b>${this.best}</b>longest rally</div>
-       <div><b>${Math.round(this.topSpeed)}</b>top km/h</div>
-       <div><b>${this.perfects}</b>perfect hits</div>
-       <div><b>${this.aces}</b>aces</div>`;
-    setTimeout(() => $('endOv').classList.remove('hidden'), 1200);
-    this.msg(w === NEAR ? 'YOU WIN THE MATCH!' : 'RIVAL TAKES IT', '', 3);
+  // Removed endTitle/endScore/endStats display - no overlay
   },
-  // ----- HUD helpers -----
-  msg(t, sub = '', dur = 1.6) {
-    const m = $('msg');
-    m.innerHTML = t ? t + (sub ? `<small>${sub}</small>` : '') : '';
-    m.classList.toggle('show', !!t);
-    clearTimeout(this.msgTimer);
-    if (t) this.msgTimer = setTimeout(() => m.classList.remove('show'), dur * 1000);
-  },
-  sub(t, dur = 3) {
-    const s = $('sub');
-    s.textContent = t || ''; s.classList.toggle('show', !!t);
-    clearTimeout(this.subTimer);
-    if (t) this.subTimer = setTimeout(() => s.classList.remove('show'), dur * 1000);
-  },
-  // unstruck toss fell flat — back to the hand, no penalty
+// unstruck toss fell flat — back to the hand, no penalty
   resetToss() {
     this.tossed = false; ball.live = false; ball.dead = false; ball.deadT = 0; ball.bounces = 0;
     apexRing.visible = false;
@@ -1135,7 +1107,6 @@ const Game = {
   togglePause() {
     if (this.over || this.mode === 'menu') return;
     this.paused = !this.paused;
-    $('pauseOv').classList.toggle('hidden', !this.paused);
     if (this.ctxFix) return;
   },
   toggleMute() {
@@ -1154,7 +1125,6 @@ const Game = {
     if (side === NEAR) {
       apexRing.position.set(ball.pos.x, this.tossApex, ball.pos.z);
       apexRing.visible = true;
-      this.sub('Strike at the peak! ← → aims', 2.5);
     }
   },
   strikeServe(side) {
@@ -1162,7 +1132,6 @@ const Game = {
     // too late — the toss already dropped; re-toss without penalty
     if (ball.lastHitter === 0 && ball.pos.y < 0.6) {
       this.resetToss();
-      if (side === NEAR) this.sub('Too late — toss again!', 2);
       return;
     }
     const r = side === NEAR ? playerRig : rivalRig;
@@ -1246,7 +1215,6 @@ const Game = {
     this.rally += 1;
     $('rally').textContent = 'RALLY ' + this.rally;
     if (side === NEAR && [10, 16, 22].includes(this.rally)) {
-      this.msg('RALLY ' + this.rally + '!', this.rally >= 16 ? 'unreal tennis' : 'the crowd is up', 1.0);
     }
     // anim: forehand/backhand by ball side
     const onBackhand = (side === NEAR ? (ball.pos.x < rig.pos.x - 0.25) : (ball.pos.x > rig.pos.x + 0.25));
@@ -1258,7 +1226,6 @@ const Game = {
       this.topSpeed = Math.max(this.topSpeed, kmh);
       if (q > 0.72) {
         this.perfects++;
-        this.msg(q > 0.9 ? 'PERFECT!' : 'CRACKING SHOT!', Math.round(kmh) + ' km/h', 0.8);
       }
     }
     SFX.pop(clamp(power * 0.7 + q * 0.5, 0.2, 1), q > 0.72);
@@ -1597,20 +1564,11 @@ function loop() {
 }
 
 // ---------- wire up UI ----------
-$('playBtn').onclick = () => Game.startFromMenu();
-$('againBtn').onclick = () => { SFX.click(); Game.startMatch(); };
-$('resumeBtn').onclick = () => Game.togglePause();
-$('quitBtn').onclick = () => { SFX.click(); Game.paused = false; $('pauseOv').classList.add('hidden'); Game.startMatch(); };
 $('pauseBtn').onclick = () => Game.togglePause();
 $('muteBtn').onclick = () => Game.toggleMute();
-$('helpBtn').onclick = () => { SFX.click(); $('helpOv').classList.remove('hidden'); };
-$('helpClose').onclick = () => { SFX.click(); $('helpOv').classList.add('hidden'); };
 Input.init();
 Game.updateBoard();
 const QS = new URLSearchParams(location.search);
 if (QS.get('hud') === '0') document.body.classList.add('shot');
-if (QS.get('play') === '1') Game.startFromMenu();
-else document.body.classList.add('menu');
 window.__gameBooted = true;
-$('loader').classList.add('hidden');
 loop();
