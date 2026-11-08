@@ -973,15 +973,6 @@ const Game = {
     this.rally = 0; this.best = 0; this.topSpeed = 0; this.perfects = 0; this.aces = 0;
     this.updateBoard();
     this.nextPoint(true);
-  }
-  startMatch() {
-    this.pts[NEAR] = this.pts[FAR] = 0;
-    this.games[NEAR] = this.games[FAR] = 0;
-    this.pointIndex = 0; this.faults = 0; this.server = NEAR;
-    this.over = false; this.diff = 0.45;
-    this.rally = 0; this.best = 0; this.topSpeed = 0; this.perfects = 0; this.aces = 0;
-    this.updateBoard();
-    this.nextPoint(true);
   },
   nextPoint(first = false) {
     this.serveSide = (this.pointIndex % 2 === 0) ? -1 : 1;
@@ -1571,6 +1562,6 @@ Game.updateBoard();
 const QS = new URLSearchParams(location.search);
 if (QS.get('hud') === '0') document.body.classList.add('shot');
 window.__gameBooted = true;
-startMatch();
+Game.startMatch();
 $('loader').classList.add('hidden');
 loop();

@@ -56,6 +56,18 @@
     font-variant-numeric:tabular-nums}
   #speedo b{font-size:18px;color:#c6ff4d}
   /* ---------- touch controls ---------- */
+  #touchUI{position:fixed;inset:0;z-index:6;pointer-events:none;display:none}
+  body.touch #touchUI{display:block}
+  #stick{position:absolute;width:120px;height:120px;border-radius:50%;border:2px solid rgba(255,255,255,.35);
+    background:rgba(255,255,255,.07);display:none;pointer-events:none}
+  #knob{position:absolute;width:54px;height:54px;border-radius:50%;background:rgba(255,255,255,.5);
+    left:33px;top:33px;box-shadow:0 0 16px rgba(198,255,77,.6)}
+  #hitBtn,#lobBtn{position:absolute;pointer-events:auto;border-radius:50%;border:2px solid rgba(255,255,255,.4);
+    font-weight:900;color:#0b0b14;cursor:pointer}
+  #hitBtn{right:22px;bottom:calc(30px + env(safe-area-inset-bottom));width:104px;height:104px;font-size:22px;
+    background:radial-gradient(circle at 35% 30%,#eaffb0,#c6ff4d 60%,#8fd62c);box-shadow:0 0 26px rgba(198,255,77,.55)}
+  #hitBtn.charge{background:radial-gradient(circle at 35% 30%,#fff,#ffd94d 55%,#ff7f3f);box-shadow:0 0 34px rgba(255,180,60,.8)}
+  #lobBtn{right:140px;bottom:calc(52px + env(safe-area-inset-bottom));width:64px;height:64px;font-size:15px;
     background:radial-gradient(circle at 35% 30%,#ffd6e7,#ff7fa5 60%,#c64f8b);box-shadow:0 0 18px rgba(255,127,165,.55)}
   /* ---------- overlays ---------- */
   .overlay{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;
@@ -82,6 +94,36 @@
   #endStats b{display:block;font-size:20px;color:#c6ff4d}
   /* screenshot / cinematic mode: scene only, no HUD */
   body.shot #hud, body.shot #vignette{display:none}
+
+  /* ---------- loader ---------- */
+  #loader{position:fixed;inset:0;z-index:100;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px;
+    background:radial-gradient(120% 90% at 50% 38%,#2b2055 0%,#161034 52%,#0a0719 100%);
+    transition:opacity .5s ease,visibility .5s ease}
+  #loader.hidden{opacity:0;visibility:hidden;pointer-events:none}
+  .ld-ball{position:relative;width:64px;height:64px;border-radius:50%;
+    background:radial-gradient(circle at 34% 30%,#eaffb0,#c6ff4d 55%,#84cc22);
+    box-shadow:0 0 44px rgba(198,255,77,.5),inset -7px -9px 16px rgba(0,0,0,.28);
+    animation:ld-bounce 1.15s cubic-bezier(.4,0,.6,1) infinite}
+  .ld-seam{position:absolute;inset:9px;border-radius:50%;
+    border:2.5px solid rgba(255,255,255,.9);border-color:rgba(255,255,255,.9) transparent transparent transparent;
+    transform:rotate(-38deg)}
+  .ld-seam.s2{transform:rotate(142deg)}
+  .ld-title{font-size:clamp(21px,5vw,29px);font-weight:900;letter-spacing:.3em;text-transform:uppercase;
+    color:#fff;text-shadow:0 0 28px rgba(255,127,165,.5);text-align:center;padding-left:.3em}
+  .ld-sub{font-size:10px;letter-spacing:.42em;text-transform:uppercase;color:var(--pink);
+    opacity:.9;font-weight:700;padding-left:.42em}
+  .ld-bar{width:min(220px,52vw);height:4px;border-radius:99px;background:rgba(255,255,255,.12);overflow:hidden}
+  .ld-bar i{display:block;width:38%;height:100%;border-radius:99px;
+    background:linear-gradient(90deg,#c6ff4d,#ffd94d,#ff7fa5);animation:ld-slide 1.35s ease-in-out infinite}
+  @keyframes ld-bounce{
+    0%,100%{transform:translateY(0) scale(1,1)}
+    45%{transform:translateY(-18px) scale(.95,1.05)}
+    62%{transform:translateY(0) scale(1.07,.93)}
+  }
+  @keyframes ld-slide{0%{transform:translateX(-115%)}100%{transform:translateX(265%)}}
+  @media (prefers-reduced-motion:reduce){.ld-ball,.ld-bar i{animation:none}}
+
   /* small phones: keep the scoreboard clear of the icon buttons */
   @media (max-width:640px){
     #scoreboard{padding:6px 9px;gap:4px}
@@ -116,10 +158,43 @@
     <button class="iconbtn" id="pauseBtn" title="Pause (P)">⏸</button>
     <button class="iconbtn" id="helpBtn" title="Help">?</button>
   </div>
-  
   <div id="power"><div id="powerfill"></div></div>
   <div id="speedo"><b id="spd">0</b> km/h</div>
 </div>
 
+<div id="touchUI">
+  <div id="stick"><div id="knob"></div></div>
+  <button id="hitBtn">HIT</button>
+  <button id="lobBtn">LOB</button>
+</div>
 
+<!-- empty: game.js toggles these based on input type -->
+<div id="keysDesk" style="display:none"></div>
+<div id="keysTouch" style="display:none"></div>
 
+<div id="loader">
+  <div class="ld-ball"><span class="ld-seam"></span><span class="ld-seam s2"></span></div>
+  <div class="ld-title">Seaside Smash</div>
+  <div class="ld-sub">Twilight Tennis</div>
+  <div class="ld-bar"><i></i></div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script>
+  // If the module never boots, say why instead of spinning forever.
+  setTimeout(function () {
+    if (window.__gameBooted) return;
+    var l = document.getElementById('loader');
+    if (!l) return;
+    l.innerHTML =
+      '<div class="ld-title" style="font-size:15px;letter-spacing:.08em;max-width:78vw;line-height:1.6">' +
+      'Could not start the game</div>' +
+      '<div class="ld-sub" style="letter-spacing:.06em;font-size:11px;text-transform:none;opacity:.75;max-width:78vw;line-height:1.8">' +
+      'Three.js did not load from the CDN. Check your connection and reload.</div>';
+  }, 12000);
+</script>
+<script type="module" src="./game.js"></script>
+</body>
+</html>
