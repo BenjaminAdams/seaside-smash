@@ -21,7 +21,85 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 const rand = (a, b) => a + Math.random() * (b - a);
 
-import { SFX } from './audio.js';
+// ---------- tiny audio engine (all synthesized) ----------
+const SFX = {
+  ctx: null, master: null, muted: false,
+  init() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.55;
+      this.master.connect(this.ctx.destination);
+      this.waves();
+    } catch (e) { /* no audio */ }
+  },
+  setMuted(m) { this.muted = m; if (this.master) this.master.gain.value = m ? 0 : 0.55; },
+  env(g, t0, a, peak, d) {
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + a + d);
+  },
+  tone(freq, dur, type = 'sine', peak = 0.5, slide = 0) {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime, o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t + dur);
+    this.env(g, t, 0.005, peak, dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.1);
+  },
+  noise(dur, peak = 0.4, fc = 1200) {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime, len = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const s = this.ctx.createBufferSource(); s.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = fc;
+    const g = this.ctx.createGain(); this.env(g, t, 0.004, peak, dur);
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(t);
+  },
+  pop(power, perfect) {
+    this.noise(0.09, 0.25 + power * 0.3, 2500);
+    this.tone(perfect ? 620 : 380 + power * 260, 0.12, 'square', 0.22, perfect ? 300 : 120);
+    if (perfect) this.tone(1240, 0.18, 'sine', 0.2, 400);
+  },
+  bounce() { this.tone(150, 0.09, 'sine', 0.3, -60); this.noise(0.05, 0.12, 700); },
+  net() { this.tone(110, 0.25, 'sawtooth', 0.25, -40); },
+  fault() { this.tone(220, 0.3, 'sawtooth', 0.25, -120); },
+  whistle(win) {
+    this.tone(win ? 2100 : 1700, 0.35, 'sine', 0.25);
+    setTimeout(() => this.tone(win ? 2700 : 1400, 0.5, 'sine', 0.25), 180);
+  },
+  click() { this.tone(700, 0.06, 'sine', 0.2); },
+  chime(win) {
+    const seq = win ? [523, 659, 784, 1046] : [392, 330, 262, 196];
+    seq.forEach((f, i) => setTimeout(() => this.tone(f, 0.4, 'triangle', 0.3), i * 140));
+  },
+  gull() {
+    if (!this.ctx || this.muted) return;
+    const f = 1250 + Math.random() * 600;
+    this.tone(f, 0.16, 'sine', 0.045, -260);
+    setTimeout(() => this.tone(f * 0.78, 0.22, 'sine', 0.035, -180), 170);
+  },
+  waves() {
+    // endless soft surf: looped noise -> lowpass, slow swell LFO
+    const ctx = this.ctx, len = ctx.sampleRate * 3;
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    let v = 0;
+    for (let i = 0; i < len; i++) { v = v * 0.98 + (Math.random() * 2 - 1) * 0.02; d[i] = v * 8; }
+    const s = ctx.createBufferSource(); s.buffer = buf; s.loop = true;
+    const f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 420;
+    const g = ctx.createGain(); g.gain.value = 0.06;
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 0.13;
+    const lg = ctx.createGain(); lg.gain.value = 0.035;
+    lfo.connect(lg); lg.connect(g.gain);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(); lfo.start();
+  }
+};
 
 // ---------- input (keyboard + touch stick + buttons) ----------
 const Input = {
@@ -41,7 +119,6 @@ const Input = {
       if (e.key.toLowerCase() === 'k' || e.key.toLowerCase() === 'l') Game.onLobButton();
       if (e.key.toLowerCase() === 'p' || e.key === 'Escape') Game.togglePause();
       if (e.key.toLowerCase() === 'm') Game.toggleMute();
-      if (e.key.toLowerCase() === 'n') Game.toggleMusic();
       if (e.key === 'Enter' && !$('menu').classList.contains('hidden')) Game.startFromMenu();
     });
     addEventListener('keyup', e => {
@@ -101,42 +178,45 @@ const Input = {
 };
 
 // ---------- renderer / scene ----------
-// The static world is a clean plate pulled from the reference clip (temporal
-// median of every frame, so the players vanish). A fixed camera solved
-// against the plate's court lines lets the 3D players and ball sit exactly
-// on it. The stage keeps the clip's 4:5 framing at any window size.
-const PLATE_W = 1080, PLATE_H = 1350, PLATE_ASPECT = PLATE_W / PLATE_H;
-const stage = $('stage');
 const container = $('game');
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio || 1, IS_TOUCH ? 1.75 : 2));
+renderer.setSize(innerWidth, innerHeight);
+// flat illustration look: unlit colours, no tone-map crush
 renderer.toneMapping = THREE.NoToneMapping;
 container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-// camera solved by least squares on 47 court-line samples (max error 0.16 m)
-const CAM = { h: 11.9226, d: 52.9111, pitch: 0.122600, yaw: -0.0029851, roll: 0.0048539, vfov: 27.1394 };
-const camera = new THREE.PerspectiveCamera(CAM.vfov, PLATE_ASPECT, 0.5, 400);
-camera.position.set(0, CAM.h, CAM.d);
-camera.rotation.set(-CAM.pitch, -CAM.yaw, -CAM.roll, 'YXZ');
-camera.updateMatrixWorld();
+const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, 0.5, 20000);
+// reference framing: high telephoto camera behind the near baseline,
+// horizon at ~19% of frame, far baseline ~56%, net ~66%, near baseline ~95%
+const CAM_BASE = new THREE.Vector3(0, 14.69, 46.33);
+const CAM_LOOK = new THREE.Vector3(0, 1.59, -20);
 let camShake = 0;
 let hitStop = 0;
-const drawSize = new THREE.Vector2(1, 1);
 
-function fitStage() {
-  // contain a 4:5 stage in the viewport, leaving room for nothing else
-  let w = innerWidth, h = innerWidth / PLATE_ASPECT;
-  if (h > innerHeight) { h = innerHeight; w = h * PLATE_ASPECT; }
-  w = Math.floor(w); h = Math.floor(h);
-  stage.style.width = w + 'px'; stage.style.height = h + 'px';
-  renderer.setSize(w, h);
-  renderer.getDrawingBufferSize(drawSize);
-  document.documentElement.style.setProperty('--stage-w', w + 'px');
-  document.documentElement.style.setProperty('--stage-h', h + 'px');
+function fitCamera() {
+  const a = camera.aspect = innerWidth / innerHeight;
+  if (a < 0.9) {
+    // portrait: pull straight back along the view ray on narrow phones
+    const k = clamp(0.8 / a, 1, 1.16);
+    camera.fov = 35;
+    CAM_BASE.set(0, 14.69 * k, 46.33 * k);
+    CAM_LOOK.set(0, 1.59 * k, -20 * k);
+  } else {
+    camera.fov = 40;
+    CAM_BASE.set(0, 12.8, 40.0);
+    CAM_LOOK.set(0, 1.5, -18.0);
+  }
+  camera.updateProjectionMatrix();
+  camera.projectionMatrix.elements[0] *= 1.13;
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  renderer.setSize(innerWidth, innerHeight);
 }
-addEventListener('resize', fitStage);
-fitStage();
+addEventListener('resize', fitCamera);
+fitCamera();
+
+// everything is unlit flat colour, so no scene lights are needed
 
 // ---------- canvas texture helpers ----------
 function canvasTex(w, h, draw) {
@@ -162,127 +242,516 @@ const blobTex = canvasTex(128, 128, (g) => {
   g.fillStyle = r; g.fillRect(0, 0, 128, 128);
 });
 
-// ---------- the plate: sky, sea, gardens, court (from the clip) ----------
-const plateTex = new THREE.TextureLoader().load('./assets/plate.jpg', () => { plateReady = true; });
-let plateReady = false;
-plateTex.colorSpace = THREE.NoColorSpace;      // sampled + written raw, so the plate's pixels pass through untouched
-plateTex.minFilter = THREE.LinearFilter;
-plateTex.generateMipmaps = false;
-
-// full-frame background: plate + living details (sea glints, lamp flicker, swell shimmer)
-const plateMat = new THREE.ShaderMaterial({
-  depthTest: false, depthWrite: false,
-  uniforms: { uPlate: { value: plateTex }, uTime: { value: 0 } },
-  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.9999, 1.0); }`,
+// ---------- sky dome (flat dusk gradient: violet zenith -> magenta -> pink horizon) ----------
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: { uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) } },
+  vertexShader: `varying vec3 vDir; void main(){ vDir = normalize(position); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
   fragmentShader: `
-    varying vec2 vUv; uniform sampler2D uPlate; uniform float uTime;
+    varying vec3 vDir; uniform float uTime; uniform vec2 uRes;
     float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
     void main(){
-      vec3 col = texture2D(uPlate, vUv).rgb;
-      vec2 px = vec2(vUv.x * 1080.0, (1.0 - vUv.y) * 1350.0);   // plate pixels, y down
-      // ---- sea: navy pixels between the horizon and the treeline
-      float sea = step(257.0, px.y) * (1.0 - step(770.0, px.y))
-                * smoothstep(0.05, 0.11, col.b - col.r) * smoothstep(0.0, 0.05, col.b - col.g);
-      float d = px.y - 255.0;
-      // perspective cells: rows grow toward the viewer
-      float lv = log(d + 12.0) * 26.0;
-      float row = floor(lv), fy = fract(lv);
-      float dRow = exp((row + 0.5) / 26.0) - 12.0;
-      float cw = (3.2 + dRow * 0.075) * 3.4;
-      float cx = px.x / cw + hash(vec2(row, 3.1)) * 9.0;
-      float cell = floor(cx), fx = fract(cx);
-      float h1 = hash(vec2(cell, row)), h2 = hash(vec2(cell * 1.7 + 4.0, row * 2.3));
-      vec2 e = vec2((fx - 0.5) / 0.30, (fy - 0.5) / 0.34);
-      float shape = smoothstep(1.0, 0.15, dot(e, e));
-      // glitter band: wide near the horizon, centred right of middle, fading toward the trees
-      float bw = 300.0 - d * 0.36;
-      float bx = (px.x - 750.0) / max(bw, 60.0);
-      float band = exp(-bx * bx * bx * bx) * smoothstep(590.0, 262.0, px.y);
-      float on = step(1.0 - band * 0.55, h2);
-      float tw = pow(max(0.0, sin(h1 * 6.283 + uTime * (1.1 + h1 * 2.2))), 5.0);
-      float glint = shape * on * tw;
-      col += vec3(0.50, 0.58, 0.76) * glint * sea * 0.62;
-      // slow swell shimmer
-      col *= 1.0 + sea * 0.022 * sin(px.y * 0.42 - uTime * 0.9 + sin(px.x * 0.012 + uTime * 0.3) * 2.0);
-      // ---- lamp globes: soft flicker + breathing halo
-      for (int i = 0; i < 2; i++) {
-        vec2 c = i == 0 ? vec2(34.0, 552.8) : vec2(1019.4, 552.9);
-        float s = float(i) * 3.7;
-        float fl = 1.0 + 0.05 * sin(uTime * 6.1 + s) + 0.03 * sin(uTime * 17.3 + s * 2.0);
-        float r = length(px - c);
-        col += vec3(1.0, 0.93, 0.80) * (exp(-r * r / 520.0) * 0.16 + exp(-r / 70.0) * 0.045) * fl;
-      }
+      float h = normalize(vDir).y;
+      // sampled from the reference: violet zenith, magenta belt at ~3 deg,
+      // deepening to mauve right at the waterline
+      vec3 hor = vec3(0.541,0.388,0.612);   // #8A639C
+      vec3 belt= vec3(0.631,0.388,0.616);   // #A1639D
+      vec3 zen = vec3(0.432,0.398,0.590);   // sampled zenith
+      vec3 col = mix(hor, belt, smoothstep(0.0, 0.045, h));
+      col = mix(col, zen, smoothstep(0.045, 0.115, h));
+      col = mix(col, vec3(0.463,0.384,0.584), smoothstep(0.022, 0.004, h));
+      col = mix(col, vec3(0.155,0.225,0.385), smoothstep(0.002, -0.006, h));
+      float sx = gl_FragCoord.x / uRes.x;
+      float dark = smoothstep(0.40, 0.02, h) * smoothstep(0.46, 0.04, sx);
+      col = mix(col, vec3(0.401, 0.390, 0.585), dark);
+      col += (hash(gl_FragCoord.xy) - 0.5) * 0.005;
+      gl_FragColor = vec4(col, 1.0);
+    }`
+});
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(12000, 48, 32), skyMat));
+
+// ---------- sea: deep navy with sparse silver glitter ----------
+const seaMat = new THREE.ShaderMaterial({
+  fog: false,
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: `varying vec3 vW; void main(){ vec4 w=modelMatrix*vec4(position,1.0); vW=w.xyz; gl_Position=projectionMatrix*viewMatrix*w; }`,
+  fragmentShader: `
+    varying vec3 vW; uniform float uTime;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+    float glitter(vec2 p, float thr){
+      vec2 cell = floor(p), f = fract(p) - 0.5;
+      float m = smoothstep(0.31, 0.02, length(f * vec2(1.0, 1.4)));
+      return m * step(thr, hash(cell));
+    }
+    void main(){
+      float far = clamp((-vW.z - 30.0) / 400.0, 0.0, 1.0);
+      vec3 col = vec3(0.128,0.190,0.332);
+      col += vec3(0.010,0.014,0.024) * smoothstep(0.45, 1.0, far);
+      vec2 p1 = vec2(vW.x * 0.78, vW.z * 2.15 + uTime * 0.05);
+      vec2 p2 = vec2(vW.x * 2.65 + 13.0, vW.z * 6.0 - uTime * 0.08);
+      float g = glitter(p1, 0.695) * 0.8 + glitter(p2, 0.845) * 0.42;
+      float cl = 0.58 + 0.24 * sin(vW.x * 0.11 + vW.z * 0.07) * sin(vW.z * 0.09 - vW.x * 0.025);
+      float band = smoothstep(0.01, 0.10, far) * (1.0 - smoothstep(0.80, 1.0, far)) * (0.36 + 0.55 * cl);
+      col += vec3(0.62,0.72,0.88) * g * band * 0.45;
+      col += vec3(0.008,0.012,0.02) * sin(vW.z * 0.04 + uTime * 0.2);
       gl_FragColor = vec4(col, 1.0);
     }`
 });
 {
-  const bg = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), plateMat);
-  bg.frustumCulled = false; bg.renderOrder = -100;
-  scene.add(bg);
+  const sea = new THREE.Mesh(new THREE.PlaneGeometry(16000, 12000), seaMat);
+  sea.rotation.x = -Math.PI / 2;
+  sea.position.set(0, -6, -6000);
+  scene.add(sea);
+  // dark headland / cliff edge between garden and water
+  const cliff = new THREE.Mesh(new THREE.BoxGeometry(260, 9, 6),
+    new THREE.MeshBasicMaterial({ color: 0x060b13 }));
+  cliff.position.set(0, -4.2, -41);
+  scene.add(cliff);
+  // dark garden floor that carries the eye out to the headland
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(340, 46),
+    new THREE.MeshBasicMaterial({ color: 0x060d09 }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.set(0, -0.06, -33);
+  scene.add(floor);
 }
 
-// occluders re-draw plate pixels in front of anything that is behind them in 3D
-function plateOccluderMat(kind) {
-  return new THREE.ShaderMaterial({
-    transparent: true, depthWrite: false, side: THREE.DoubleSide,
-    uniforms: { uPlate: { value: plateTex }, uRes: { value: drawSize } },
-    vertexShader: `void main(){ gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-    fragmentShader: `
-      uniform sampler2D uPlate; uniform vec2 uRes;
-      void main(){
-        vec3 c = texture2D(uPlate, gl_FragCoord.xy / uRes).rgb;
-        float lum = dot(c, vec3(0.299, 0.587, 0.114));
-        ${kind === 'net'
-          ? 'float a = max(0.52, smoothstep(0.42, 0.62, lum));'                  // mesh veils, tape hides
-          : 'float a = 1.0 - smoothstep(0.075, 0.13, lum); if (a < 0.01) discard;'} // only the dark hedge
-        gl_FragColor = vec4(c, a);
-      }`
-  });
-}
-// net: matches the plate's net (posts at x = ±6.88 m, tape 1.07 m at posts, 0.914 m centre)
-const NET_HALF = 6.88;
-const netTopAt = x => COURT.NET_C + (COURT.NET_P - COURT.NET_C) * Math.min(1, (Math.abs(x) / NET_HALF) ** 2);
+// ---------- garden: wall, hedge, bougainvillea, pines, lamps ----------
+const garden = new THREE.Group(); scene.add(garden);
 {
-  const geo = new THREE.PlaneGeometry(NET_HALF * 2, 1, 48, 1);
-  const pos = geo.attributes.position;
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i), top = pos.getY(i) > 0;
-    const k = Math.min(1, (x / NET_HALF) ** 2);
-    pos.setY(i, top ? COURT.NET_C + (COURT.NET_P - COURT.NET_C) * k + 0.035 : 0);
+  const MAT_BLACK = new THREE.MeshBasicMaterial({ color: 0x040705 });
+  const MAT_BLACK2 = new THREE.MeshBasicMaterial({ color: 0x060b07 });
+  const MAT_FG = new THREE.MeshBasicMaterial({ color: 0x081108 });
+  const MAT_POLE = new THREE.MeshBasicMaterial({ color: 0x0c1016 });
+
+  // fine leaf-cluster cutouts: break hedge and canopies into wispy silhouettes
+  function leafTexture(seed) {
+    return canvasTex(256, 256, (g, W, H) => {
+      g.clearRect(0, 0, W, H);
+      let r = seed;
+      const rnd = () => (r = (r * 9301 + 49297) % 233280) / 233280;
+      for (let i = 0; i < 820; i++) {
+        const a = rnd() * Math.PI * 2;
+        const rad = Math.pow(rnd(), 0.52) * 116;
+        const x = W / 2 + Math.cos(a) * rad;
+        const y = H / 2 + Math.sin(a) * rad * 0.92;
+        const len = 1.5 + rnd() * 3.6, wid = 1.3 + rnd() * 3.0;
+        g.fillStyle = `rgba(255,255,255,${0.5 + rnd() * 0.5})`;
+        g.save(); g.translate(x, y); g.rotate(rnd() * Math.PI * 2);
+        g.beginPath(); g.ellipse(0, 0, len, wid, 0, 0, 7); g.fill(); g.restore();
+      }
+    });
   }
-  const net = new THREE.Mesh(geo, plateOccluderMat('net'));
-  net.renderOrder = 10; scene.add(net);
-}
-// foreground hedge: a low vertical card just past the near baseline
-{
-  const fg = new THREE.Mesh(new THREE.PlaneGeometry(60, 1.3), plateOccluderMat('fg'));
-  fg.position.set(0, 0.65, 15.0); fg.renderOrder = 11; scene.add(fg);
-}
+  const leafMats = [11, 47, 89].map((seed, i) => new THREE.MeshBasicMaterial({
+    map: leafTexture(seed), color: [0x040906, 0x081109, 0x0e1d12][i],
+    alphaTest: 0.34, side: THREE.DoubleSide
+  }));
+  let leafPick = 0;
+  function leafCard(parent, x, y, z, w, h, rz, mi) {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+      leafMats[mi === undefined ? (leafPick++) % 3 : mi]);
+    m.position.set(x, y, z);
+    m.rotation.x = -0.16; m.rotation.z = rz;
+    parent.add(m);
+  }
 
-// a few fireflies drifting over the flower beds — barely there
-const fireflies = [];
-{
-  const spots = [[-9.5, -12], [-10.5, -6], [-9, 2], [9.8, -11], [10.6, -5], [9.2, 4], [-4, -15.5], [3.5, -15.8], [7.5, -15.2]];
-  for (const [x, z] of spots) {
-    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: glowTex, color: 0xe8ff9a, transparent: true, opacity: 0,
+  // low pale wall right behind the far baseline
+  const wallMat = new THREE.MeshBasicMaterial({ color: 0xa39179 });
+  const back = new THREE.Mesh(new THREE.BoxGeometry(33, 0.12, 0.26), wallMat);
+  back.position.set(0, 0.09, -14.5); garden.add(back);
+
+  const blob = (mat, r, x, y, z, sy = 0.7) => {
+    const m = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 1), mat);
+    m.position.set(x, y, z); m.scale.y = sy;
+    m.rotation.set(rand(0, 3), Math.random() * 6, rand(0, 3)); garden.add(m); return m;
+  };
+
+  // continuous near-black hedge behind the wall
+  for (let x = -17; x <= 17; x += 1.1) {
+    blob(Math.random() < 0.5 ? MAT_BLACK : MAT_BLACK2, rand(0.75, 1.3), x + rand(-0.3, 0.3), rand(0.7, 1.15), -16.5, rand(0.7, 0.95));
+    if (Math.random() < 0.7) blob(MAT_BLACK2, rand(0.45, 0.85), x + rand(-0.4, 0.4), rand(0.3, 0.65), -15.4, 0.7);
+  }
+  // low bushes filling the strip in front of the hedge
+  for (let x = -16; x <= 16; x += 1.0) {
+    blob(MAT_BLACK2, rand(0.35, 0.75), x + rand(-0.3, 0.3), rand(0.2, 0.5), -15.25, 0.65);
+  }
+  // low side beds outside the court
+  for (let z = -13; z <= 13; z += 1.35) {
+    for (const sx of [-10.9, 10.9]) {
+      blob(MAT_BLACK2, rand(0.55, 0.95), sx + rand(-0.3, 0.3), 0.38, z, 0.72);
+    }
+  }
+  // ragged leaf fringe along the top of the hedge
+  for (let i = 0; i < 46; i++) {
+    leafCard(garden, rand(-18, 18), rand(0.95, 1.55), rand(-15.6, -15.1),
+      rand(1.1, 2.0), rand(0.55, 1.1), rand(0, 6));
+  }
+
+  // bougainvillea haze: pink speckle sprites along the hedge and side beds
+  const bloomTex = canvasTex(256, 128, (g, W, H) => {
+    g.clearRect(0, 0, W, H);
+    // draw into a handful of soft clumps so the hedge has gaps, not a pink stripe
+    const centers = [];
+    for (let i = 0; i < 6; i++) centers.push([rand(34, W - 34), rand(H * 0.3, H * 0.9), rand(28, 58)]);
+    for (let i = 0; i < 600; i++) {
+      const c = centers[i % centers.length];
+      const a = Math.random() * Math.PI * 2, rad = Math.pow(Math.random(), 0.65) * c[2];
+      const x = c[0] + Math.cos(a) * rad, y = c[1] + Math.sin(a) * rad * 0.72;
+      const rr = 205 + Math.random() * 45, gg = 74 + Math.random() * 58, bb = 124 + Math.random() * 52;
+      g.fillStyle = `rgba(${rr | 0},${gg | 0},${bb | 0},${0.45 + Math.random() * 0.5})`;
+      g.beginPath(); g.arc(x, y, rand(0.7, 2.3), 0, 7); g.fill();
+    }
+  });
+  const bloomMat = new THREE.SpriteMaterial({ map: bloomTex, transparent: true, depthWrite: false, opacity: 1 });
+  const clusters = [-11.5, -8.6, -6.2, -2.4, 1.2, 6.4, 9.1, 12.8, 15.2];
+  for (let i = 0; i < 14; i++) {
+    const s = new THREE.Sprite(bloomMat.clone());
+    const w = rand(4.8, 7.8);
+    s.scale.set(w, w * 0.55, 1);
+    s.position.set(clusters[i % clusters.length] + rand(-1.8, 1.8), rand(0.9, 2.0), -16.0 + rand(-0.5, 0.25));
+    s.material.opacity = rand(0.8, 1);
+    garden.add(s);
+  }
+  for (const sx of [-10.7, 10.7]) {
+    for (let z = -12.5; z < 12; z += 1.0) {
+      const s = new THREE.Sprite(bloomMat.clone());
+      const w = rand(2.4, 4.0);
+      s.scale.set(w, w * 0.58, 1);
+      s.position.set(sx + rand(-0.45, 0.45), rand(0.3, 0.85), z + rand(-0.5, 0.5));
+      s.material.opacity = rand(0.72, 1);
+      garden.add(s);
+    }
+  }
+
+  // --- umbrella pines: black, wide layered canopies on splayed branches
+  function pine(x, z, s, ry = 0) {
+    const g = new THREE.Group();
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.20 * s, 0.36 * s, 5.4 * s, 7), MAT_BLACK);
+    trunk.position.y = 2.7 * s; g.add(trunk);
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2 + 0.4;
+      const len = rand(2.6, 3.5) * s;
+      const br = new THREE.Mesh(new THREE.CylinderGeometry(0.05 * s, 0.15 * s, len, 5), MAT_BLACK);
+      br.position.set(Math.cos(a) * len * 0.32, (4.65 + rand(0, 0.3)) * s, Math.sin(a) * len * 0.32);
+      br.rotation.z = -Math.cos(a) * 0.72;
+      br.rotation.x = Math.sin(a) * 0.72;
+      g.add(br);
+    }
+    const canopy = new THREE.Group(); canopy.position.y = 4.65 * s; g.add(canopy);
+    for (let i = 0; i < 6; i++) {
+      const tall = new THREE.Mesh(new THREE.IcosahedronGeometry(rand(0.9, 1.35) * s, 1), MAT_BLACK);
+      tall.position.set(rand(-1.2, 1.2) * s, rand(0.4, 0.95) * s, rand(-1.0, 1.0) * s);
+      tall.scale.y = rand(0.50, 0.72);
+      canopy.add(tall);
+    }
+    const core = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), MAT_BLACK);
+    core.scale.set(2.55 * s, 1.12 * s, 2.30 * s); core.position.y = 0.90 * s; canopy.add(core);
+    // a few larger sub-crowns give the layered, clumped pine shape
+    for (let i = 0; i < 3; i++) {
+      const sub = new THREE.Mesh(new THREE.IcosahedronGeometry(rand(0.9, 1.3) * s, 1), MAT_BLACK);
+      sub.position.set(rand(-1.8, 1.8) * s, rand(0.55, 1.25) * s, rand(-1.4, 1.4) * s);
+      sub.scale.y = rand(0.55, 0.75);
+      canopy.add(sub);
+    }
+    for (let i = 0; i < 130; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const rr = Math.pow(Math.random(), 0.42) * 3.02 * s;
+      const lobe = new THREE.Mesh(new THREE.IcosahedronGeometry(rand(0.32, 0.86) * s, 1), MAT_BLACK);
+      lobe.position.set(Math.cos(a) * rr, rand(-0.25, 1.3) * s, Math.sin(a) * rr * 0.86);
+      lobe.scale.y = rand(0.5, 0.7);
+      lobe.rotation.set(rand(0, 3), rand(0, 3), rand(0, 3));
+      canopy.add(lobe);
+    }
+    g.position.set(x, 0, z); g.rotation.y = ry; garden.add(g);
+  }
+  function cypress(x, z, s) {
+    const g = new THREE.Group();
+    for (const [r, h, yy] of [[0.85, 5.3, 2.7], [0.62, 3.8, 4.4], [0.40, 2.6, 6.0]]) {
+      const c = new THREE.Mesh(new THREE.ConeGeometry(r * s, h * s, 7), MAT_BLACK);
+      c.position.y = yy * s; c.rotation.y = rand(0, 3); g.add(c);
+    }
+    const top = new THREE.Mesh(new THREE.ConeGeometry(0.26 * s, 1.1 * s, 6), MAT_BLACK);
+    top.position.y = 6.9 * s; g.add(top);
+    g.position.set(x, 0, z); garden.add(g);
+  }
+  // left cluster, big right pine, far-left cypress; centre kept open to the sea
+  pine(6.4, -27, 1.78, 0.35);
+  pine(13.6, -30, 1.20, 1.2);
+  pine(-8.0, -27.5, 1.42, 0.1);
+  pine(-12.8, -30, 1.15, 0.8);
+  cypress(-12.0, -18.9, 1.9);
+  function agave(x, z, s) {
+    const g = new THREE.Group();
+    for (let i = 0; i < 14; i++) {
+      const a = (i / 14) * Math.PI * 2 + rand(-0.1, 0.1);
+      const len = rand(1.4, 2.4) * s;
+      const leaf = new THREE.Mesh(new THREE.ConeGeometry(0.11 * s, len, 4), MAT_BLACK);
+      leaf.position.set(Math.cos(a) * 0.35 * s, len * 0.45, Math.sin(a) * 0.35 * s);
+      leaf.rotation.z = -Math.cos(a) * rand(0.55, 0.95);
+      leaf.rotation.x = Math.sin(a) * rand(0.55, 0.95);
+      g.add(leaf);
+    }
+    g.position.set(x, 0.5, z); garden.add(g);
+  }
+  agave(7.6, -20.5, 1.15);
+  agave(11.4, -22.5, 0.8);
+  agave(-11.2, -19.5, 0.7);
+  // low black treeline immediately behind the hedge
+  for (let i = 0; i < 34; i++) {
+    const m = new THREE.Mesh(new THREE.IcosahedronGeometry(rand(0.8, 1.7), 1), MAT_BLACK);
+    m.position.set(rand(-30, 30), rand(0.35, 1.0), rand(-23, -19.5));
+    m.scale.y = rand(0.6, 0.85);
+    garden.add(m);
+  }
+  // distant soft treeline connecting the heads
+  for (let i = 0; i < 26; i++) {
+    const x = rand(-30, 30), s = rand(1.0, 2.0);
+    const m = new THREE.Mesh(new THREE.IcosahedronGeometry(s, 1), MAT_BLACK2);
+    m.position.set(x, rand(0.1, 0.8), rand(-34, -27));
+    m.scale.y = rand(0.4, 0.7);
+    garden.add(m);
+  }
+
+  // lamps: slim posts, small bright globes at the far corners
+  window.__lampLights = [];
+  for (const sx of [-12.6, 12.6]) {
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.05, 6.95, 8), MAT_POLE);
+    pole.position.set(sx, 3.475, -15.5); garden.add(pole);
+    const orb = new THREE.Mesh(new THREE.SphereGeometry(0.22, 14, 10),
+      new THREE.MeshBasicMaterial({ color: 0xfffdf0 }));
+    orb.position.set(sx, 7.0, -15.5); garden.add(orb);
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: 0xfff8e8, transparent: true, opacity: 0.5,
       blending: THREE.AdditiveBlending, depthWrite: false
     }));
-    sp.scale.set(0.16, 0.16, 1);
-    scene.add(sp);
-    fireflies.push({ sp, x, z, y: rand(0.4, 1.6), ph: rand(0, 20), sp2: rand(0.5, 1.2) });
+    halo.scale.set(1.45, 1.45, 1); halo.material.opacity = 0.65;
+    halo.position.copy(orb.position); garden.add(halo);
+    window.__lampLights.push({ halo, seed: Math.random() * 10 });
   }
-}
-function updateScenery(t) {
-  plateMat.uniforms.uTime.value = t;
-  for (const f of fireflies) {
-    const a = t * 0.35 * f.sp2 + f.ph;
-    f.sp.position.set(f.x + Math.sin(a) * 0.9, f.y + Math.sin(a * 1.7) * 0.35, f.z + Math.cos(a * 0.8) * 0.9);
-    const blink = Math.max(0, Math.sin(t * 0.9 * f.sp2 + f.ph * 3.0));
-    f.sp.material.opacity = blink * blink * 0.55;
+
+  // fine foreground thicket: tiny leaf clusters, ragged top around 90%
+  for (let layer = 0; layer < 5; layer++) {
+    for (let i = 0; i < 300; i++) {
+      const x = rand(-9.4, 9.4);
+      const z = rand(16.0, 20.6);
+      const edge = Math.abs(x) > 5.4;
+      const h = rand(0.09, 0.24) + (z - 16.0) * 0.09 + layer * 0.015;
+      const hh = h * (edge ? 1.16 : 1.0);
+      const w = rand(0.09, 0.28);
+      const m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1),
+        Math.random() < 0.6 ? MAT_FG : MAT_BLACK2);
+      m.position.set(x, hh * 0.55, z);
+      m.scale.set(w, hh * 0.5, w * 0.8);
+      m.rotation.set(rand(0, 3), rand(0, 6), rand(0, 3));
+      garden.add(m);
+    }
+  }
+  // tall rounded bushes anchoring the bottom corners
+  for (const [bx, bz] of [[-7.0, 17.0], [7.0, 17.2]]) {
+    for (let i = 0; i < 5; i++) {
+      const h = rand(0.9, 1.35);
+      const m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), MAT_BLACK);
+      m.position.set(bx + rand(-0.5, 0.5), h * 0.55, bz + rand(-0.35, 0.35));
+      m.scale.set(rand(0.5, 0.9), h * 0.5, rand(0.5, 0.8));
+      m.rotation.set(rand(0, 3), rand(0, 6), rand(0, 3));
+      garden.add(m);
+    }
+  }
+  for (let i = 0; i < 380; i++) {
+    const x = rand(-9.4, 9.4);
+    const z = rand(15.8, 20.6);
+    const len = rand(0.18, 0.62);
+    const blade = new THREE.Mesh(new THREE.ConeGeometry(rand(0.012, 0.04), len, 3), MAT_BLACK);
+    blade.position.set(x, len * 0.55, z);
+    blade.rotation.set(rand(-0.6, 0.6), rand(0, 6), rand(-0.6, 0.6));
+    garden.add(blade);
+  }
+  // fine leaf crown at the far edge of the thicket, shaping the silhouette
+  for (let i = 0; i < 170; i++) {
+    const x = rand(-9.6, 9.6);
+    const z = rand(15.9, 18.3);
+    const h = rand(0.24, 0.44) + (18.3 - z) * 0.08;
+    leafCard(garden, x, h * 0.46, z, h * rand(1.6, 2.6), h, rand(-0.55, 0.55),
+      Math.random() < 0.35 ? 2 : 1);
+  }
+  // deeper fill so the band stays solid
+  for (let i = 0; i < 100; i++) {
+    const x = rand(-9.6, 9.6);
+    const z = rand(17.8, 20.8);
+    const h = rand(0.6, 1.4);
+    leafCard(garden, x, h * 0.44, z, h * rand(1.4, 2.2), h, rand(-0.5, 0.5),
+      Math.random() < 0.6 ? 0 : 1);
+  }
+  // landmark bushes matching the reference's uneven top
+  for (const [bx, bz, bh] of [[-5.9, 16.1, 1.15], [3.5, 16.0, 1.0], [6.9, 18.8, 0.7], [-6.9, 19.0, 0.7]]) {
+    for (let i = 0; i < 6; i++) {
+      const h = bh * rand(0.7, 1.15);
+      leafCard(garden, bx + rand(-1.0, 1.0), h * 0.46, bz + rand(-0.5, 0.5),
+        h * rand(1.2, 1.9), h, rand(-0.55, 0.55), Math.random() < 0.5 ? 1 : 0);
+    }
+  }
+  // solid mass under the tall left bush
+  for (let i = 0; i < 4; i++) {
+    const h = rand(0.4, 0.7);
+    const m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), MAT_FG);
+    m.position.set(-6.0 + rand(-0.9, 0.9), h * 0.55, 16.1 + rand(-0.6, 0.6));
+    m.scale.set(rand(0.45, 0.9), h * 0.55, rand(0.4, 0.8));
+    m.rotation.set(rand(0, 3), rand(0, 6), rand(0, 3));
+    garden.add(m);
+  }
+  // yucca fans breaking the edge
+  for (const [fx, fz, fs, n] of [[-6.4, 19.4, 1.25, 13], [3.4, 19.8, 1.35, 14], [7.2, 20.2, 1.05, 10]]) {
+    for (let i = 0; i < n; i++) {
+      const len = rand(1.1, 2.0) * fs;
+      const a = (i / n) * Math.PI * 2 + rand(-0.14, 0.14);
+      const leaf = new THREE.Mesh(new THREE.ConeGeometry(rand(0.06, 0.13), len, 4), MAT_BLACK);
+      leaf.position.set(fx + Math.cos(a) * 0.28, len * 0.42, fz + Math.sin(a) * 0.22);
+      leaf.rotation.set(Math.sin(a) * rand(0.5, 0.9), rand(0, 6), -Math.cos(a) * rand(0.5, 0.9));
+      garden.add(leaf);
+    }
   }
 }
 
+// merge the static garden into a few draw calls (big mobile win)
+(function mergeGarden() {
+  const groups = new Map();
+  garden.traverse(o => {
+    if (!o.isMesh) return;
+    if (!groups.has(o.material)) groups.set(o.material, []);
+    groups.get(o.material).push(o);
+  });
+  for (const [mat, list] of groups) {
+    if (list.length < 2) continue;
+    let total = 0;
+    const geos = list.map(o => {
+      o.updateWorldMatrix(true, false);
+      const g = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry.clone();
+      g.applyMatrix4(o.matrixWorld);
+      total += g.attributes.position.count;
+      return g;
+    });
+    const pos = new Float32Array(total * 3);
+    const useUV = geos.every(g => g.attributes.uv);
+    const uv = useUV ? new Float32Array(total * 2) : null;
+    let off = 0, uoff = 0;
+    for (const g of geos) {
+      pos.set(g.attributes.position.array, off);
+      off += g.attributes.position.array.length;
+      if (uv) { uv.set(g.attributes.uv.array, uoff); uoff += g.attributes.uv.array.length; }
+      g.dispose();
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    if (uv) merged.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    const mesh = new THREE.Mesh(merged, mat);
+    mesh.frustumCulled = false;
+    garden.add(mesh);
+    for (const o of list) o.parent.remove(o);
+  }
+})();
+
+// ---------- court ----------
+function courtTexture() {
+  return canvasTex(1024, 2220, (g, W, H) => {
+    g.fillStyle = '#365033'; g.fillRect(0, 0, W, H);
+    // barely-there mow bands
+    const bands = 9;
+    g.fillStyle = 'rgba(255,255,255,0.022)';
+    for (let i = 0; i < bands; i += 2) g.fillRect(0, H / bands * i, W, H / bands);
+    const sh = g.createLinearGradient(0, 0, 0, H * 0.30);
+    sh.addColorStop(0, 'rgba(8,34,20,0.44)'); sh.addColorStop(0.30, 'rgba(8,28,16,0.24)'); sh.addColorStop(1, 'rgba(8,24,14,0)');
+    g.fillStyle = sh; g.fillRect(0, 0, W, H * 0.30);
+    // fine grain
+    for (let i = 0; i < 2600; i++) {
+      g.fillStyle = Math.random() < 0.5 ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.018)';
+      g.fillRect(Math.random() * W, Math.random() * H, 2, 2);
+    }
+    // slightly darker at the sides
+    const vg = g.createLinearGradient(0, 0, W, 0);
+    vg.addColorStop(0, 'rgba(0,0,0,0.09)'); vg.addColorStop(0.12, 'rgba(0,0,0,0)');
+    vg.addColorStop(0.88, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.09)');
+    g.fillStyle = vg; g.fillRect(0, 0, W, H);
+
+    const s = 93.4;                        // px per metre — texture fills the court plane
+    const cx = W / 2, cy = H / 2;
+    const hwD = COURT.WD / 2 * s, hl = COURT.L / 2 * s;
+    const hwS = COURT.WS / 2 * s, serv = COURT.SERV * s;
+    g.strokeStyle = '#ecdfc0'; g.fillStyle = '#ecdfc0';
+    g.lineWidth = 2.7;
+    g.strokeRect(cx - hwD + 4, cy - hl + 4, hwD * 2 - 8, hl * 2 - 8);
+    g.lineWidth = 2.2;
+    g.beginPath();
+    g.moveTo(cx - hwS, cy - hl + 4); g.lineTo(cx - hwS, cy + hl - 4);
+    g.moveTo(cx + hwS, cy - hl + 4); g.lineTo(cx + hwS, cy + hl - 4);
+    g.moveTo(cx - hwS, cy - serv); g.lineTo(cx + hwS, cy - serv);
+    g.moveTo(cx - hwS, cy + serv); g.lineTo(cx + hwS, cy + serv);
+    g.stroke();
+    g.fillRect(cx - 1.1, cy - serv, 2.2, serv * 2);
+    g.fillRect(cx - 1.1, cy - hl + 4, 2.2, 16); g.fillRect(cx - 1.1, cy + hl - 20, 2.2, 16);
+  });
+}
+{
+  // dark surrounding grass, then the court itself
+  const apron = new THREE.Mesh(new THREE.PlaneGeometry(38, 46),
+    new THREE.MeshBasicMaterial({ color: 0x314b34 }));
+  apron.rotation.x = -Math.PI / 2; apron.position.set(0, -0.03, 0); scene.add(apron);
+  const court = new THREE.Mesh(new THREE.PlaneGeometry(COURT.WD, COURT.L),
+    new THREE.MeshBasicMaterial({ map: courtTexture() }));
+  court.rotation.x = -Math.PI / 2; scene.add(court);
+  const surround = new THREE.Mesh(new THREE.PlaneGeometry(90, 70),
+    new THREE.MeshBasicMaterial({ color: 0x16251c }));
+  surround.rotation.x = -Math.PI / 2; surround.position.set(0, -0.05, -6); scene.add(surround);
+  // black planting bed under the foreground shrubs so the bottom band stays solid
+  const bed = new THREE.Mesh(new THREE.PlaneGeometry(110, 34),
+    new THREE.MeshBasicMaterial({ color: 0x030604 }));
+  bed.rotation.x = -Math.PI / 2; bed.position.set(0, 0.012, 33); scene.add(bed);
+  const hedgeShade = new THREE.Mesh(new THREE.PlaneGeometry(46, 4.2),
+    new THREE.MeshBasicMaterial({ color: 0x0f1a12 }));
+  hedgeShade.rotation.x = -Math.PI / 2; hedgeShade.position.set(0, -0.02, -14.4); scene.add(hedgeShade);
+}
+// ---------- net ----------
+const netTopAt = x => COURT.NET_C + (COURT.NET_P - COURT.NET_C) * Math.min(1, (Math.abs(x) / 6.4) ** 2);
+{
+  const netTex = canvasTex(1024, 64, (g, W, H) => {
+    g.clearRect(0, 0, W, H);
+    g.strokeStyle = 'rgba(118,130,120,0.5)'; g.lineWidth = 1.1;
+    for (let x = 0; x <= W; x += 7) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); }
+    for (let y = 0; y <= H; y += 7) { g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
+  });
+  const geo = new THREE.PlaneGeometry(12.8, 0.95, 32, 1);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    if (pos.getY(i) > 0.4) pos.setY(i, pos.getY(i) - (1 - Math.min(1, Math.abs(pos.getX(i)) / 6.4)) * 0.156);
+  }
+  const net = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    map: netTex, transparent: true, side: THREE.DoubleSide, alphaTest: 0.15
+  }));
+  net.position.set(0, 0.55, 0.8); scene.add(net);
+  const tape = new THREE.Mesh(new THREE.BoxGeometry(12.8, 0.042, 0.05),
+    new THREE.MeshBasicMaterial({ color: 0xe7dcbb }));
+  tape.position.set(0, 1.0, 0.8); scene.add(tape);
+  const postMat = new THREE.MeshBasicMaterial({ color: 0x0b0d12 });
+  for (const sx of [-6.55, 6.55]) {
+    const p = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 1.12, 8), postMat);
+    p.position.set(sx, 0.56, 0.8); scene.add(p);
+  }
+  // soft net shade pooling toward the camera
+  const shadeTex = canvasTex(256, 96, (g, W, H) => {
+    g.clearRect(0, 0, W, H);
+    const grd = g.createLinearGradient(0, 0, 0, H);
+    grd.addColorStop(0, 'rgba(255,255,255,0)');
+    grd.addColorStop(0.45, 'rgba(255,255,255,.55)');
+    grd.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grd; g.fillRect(0, 0, W, H);
+    g.globalCompositeOperation = 'destination-out';
+    for (let x = 0; x < W; x += 12) g.fillRect(x, 0, 2, H);
+    for (let y = 0; y < H; y += 12) g.fillRect(0, y, W, 2);
+  });
+  const netShade = new THREE.Mesh(new THREE.PlaneGeometry(13.4, 3.0),
+    new THREE.MeshBasicMaterial({ map: shadeTex, color: 0x0b140d, transparent: true, opacity: 0.4, depthWrite: false }));
+  netShade.rotation.x = -Math.PI / 2;
+  netShade.position.set(0, 0.016, 1.5); scene.add(netShade);
+}
+// (no floating motes — the reference is still and clean)
 // ---------- player rigs (black silhouettes like the clip) ----------
 const SILH = new THREE.MeshBasicMaterial({ color: 0x05070b });
 function makeRacket() {
@@ -315,9 +784,9 @@ function makePlayer() {
   const armRm = limb(0.07, 0.5); armRm.position.y = -0.25; armR.add(armRm);
   const racket = makeRacket(); racket.position.y = -0.5; racket.rotation.x = 0.4; armR.add(racket);
   // blob shadow
-  const blob = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 1.35),
-    new THREE.MeshBasicMaterial({ map: blobTex, transparent: true, depthWrite: false, opacity: 0.5 }));
-  blob.rotation.x = -Math.PI / 2; blob.position.set(0, 0.02, 0); root.add(blob);
+  const blob = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 6.4),
+    new THREE.MeshBasicMaterial({ map: blobTex, transparent: true, depthWrite: false, opacity: 0.4 }));
+  blob.rotation.x = -Math.PI / 2; blob.position.set(0.35, 0.02, -2.3); root.add(blob);
   scene.add(root);
   return {
     root, body, hips, torso, head, legL, legR, armL, armR, racket, blob,
@@ -365,8 +834,7 @@ function makePlayer() {
 }
 const playerRig = makePlayer();   // YOU (near)
 const rivalRig = makePlayer();    // RIVAL (far)
-// sized to the clip's silhouettes (~104 px near, ~74 px far on the 1350 px plate)
-playerRig.root.scale.setScalar(0.76); rivalRig.root.scale.setScalar(0.76);
+playerRig.root.scale.setScalar(1.08); rivalRig.root.scale.setScalar(1.08);
 
 // ---------- ball, trail, markers ----------
 const ball = {
@@ -376,11 +844,12 @@ const ball = {
     map: glowTex, color: 0xc6ff4d, transparent: true, opacity: 0.95,
     blending: THREE.AdditiveBlending, depthWrite: false
   })),
+  light: new THREE.PointLight(0xc6ff4d, 8, 9, 2),
   pos: new THREE.Vector3(0, 1, 12), vel: new THREE.Vector3(),
   live: false, dead: false, lastHitter: 0, bounces: 0, firstIn: false, netTouch: false, deadT: 0, airT: 0,
 };
 ball.glow.scale.set(0.32, 0.32, 1);
-scene.add(ball.mesh, ball.glow);
+scene.add(ball.mesh, ball.glow, ball.light);
 
 const trailPool = [];
 for (let i = 0; i < 18; i++) {
@@ -508,7 +977,6 @@ const Game = {
     this.games[NEAR] = this.games[FAR] = 0;
     this.pointIndex = 0; this.faults = 0; this.server = NEAR;
     this.over = false; this.diff = 0.45;
-    SFX.setIntensity(1);
     this.rally = 0; this.best = 0; this.topSpeed = 0; this.perfects = 0; this.aces = 0;
     $('endOv').classList.add('hidden');
     this.updateBoard();
@@ -578,16 +1046,17 @@ const Game = {
       this.pointIndex = 0;
       this.diff = clamp(this.diff + (w === FAR ? 0.07 : -0.04), 0.35, 0.92);
       this.updateBoard();
+      SFX.whistle(w === NEAR);
       if (this.games[w] >= WIN_GAMES) return this.matchOver(w);
       this.msg(w === NEAR ? 'GAME — YOU!' : 'GAME — RIVAL', `Games ${this.games[NEAR]} — ${this.games[FAR]}`, 2.4);
-      SFX.game(w === NEAR);
+      SFX.chime(w === NEAR);
       setTimeout(() => { if (!this.over) { this.nextPoint(); } }, 2500);
     } else {
       this.pointIndex++;
       this.updateBoard();
       const deuce = this.pts[NEAR] >= 3 && this.pts[FAR] >= 3 && this.pts[NEAR] === this.pts[FAR];
       this.msg(big || reason, deuce ? 'DEUCE' : '', 1.8);
-      SFX.point(w === NEAR);
+      if (w === NEAR) SFX.whistle(true);
       setTimeout(() => { if (!this.over && this.mode === 'point') this.nextPoint(); }, 2000);
     }
   },
@@ -599,8 +1068,7 @@ const Game = {
       playerRig.jumpT = 0; playerRig.swing('fh');
       camShake = 0.35;
     }
-    SFX.match(w === NEAR);
-    setTimeout(() => SFX.setIntensity(0), 2500);
+    SFX.chime(w === NEAR); SFX.whistle(w === NEAR);
     $('endTitle').textContent = w === NEAR ? 'VICTORY ✨' : 'RIVAL WINS';
     $('endScore').textContent = `${this.games[NEAR]} — ${this.games[FAR]}`;
     $('endStats').innerHTML =
@@ -647,14 +1115,12 @@ const Game = {
       if (this.mode === 'rally') {
         this.charging = true; this.charge = 0;
         $('power').classList.add('show');
-        SFX.chargeStart();
       }
     } else if (this.charging) {
       $('power').classList.remove('show');
       this.charging = false;
-      SFX.chargeStop();
       if (this.mode === 'rally') {
-        if (!this.tryHit(NEAR, 'flat', this.charge, Input.move)) { playerRig.swing('fh'); SFX.swing(this.charge * 0.6, panOf(playerRig.pos.x)); } // whiff
+        if (!this.tryHit(NEAR, 'flat', this.charge, Input.move)) playerRig.swing('fh'); // whiff
       }
       this.charge = 0;
     }
@@ -662,7 +1128,7 @@ const Game = {
   onLobButton() {
     if (this.paused || this.over) return;
     if (this.mode === 'rally') {
-      if (!this.tryHit(NEAR, 'lob', 0.5, Input.move)) { playerRig.swing('fh'); SFX.swing(0.3, panOf(playerRig.pos.x)); }
+      if (!this.tryHit(NEAR, 'lob', 0.5, Input.move)) playerRig.swing('fh');
     }
     else if (this.mode === 'serve' && this.tossed && this.server === NEAR) this.strikeServe(NEAR);
   },
@@ -670,17 +1136,11 @@ const Game = {
     if (this.over || this.mode === 'menu') return;
     this.paused = !this.paused;
     $('pauseOv').classList.toggle('hidden', !this.paused);
-    SFX.setPaused(this.paused);
-    if (this.paused && this.charging) { this.charging = false; this.charge = 0; $('power').classList.remove('show'); }
+    if (this.ctxFix) return;
   },
   toggleMute() {
     SFX.setMuted(!SFX.muted);
     $('muteBtn').textContent = SFX.muted ? '🔇' : '🔊';
-  },
-  toggleMusic() {
-    SFX.init();
-    SFX.setMusic(!SFX.musicOn);
-    $('musicBtn').classList.toggle('off', !SFX.musicOn);
   },
   // ----- serve -----
   tossServe(side) {
@@ -690,7 +1150,6 @@ const Game = {
     ball.vel.set(rand(-0.2, 0.2), 7.2, 0);
     ball.live = true; ball.dead = false; ball.lastHitter = 0; ball.bounces = 0; ball.netTouch = false; ball.airT = 0; ball.deadT = 0;
     this.tossApex = 1.5 + 7.2 * 7.2 / (2 * GRAV);
-    SFX.toss(side === FAR);
     r.swing('serve');
     if (side === NEAR) {
       apexRing.position.set(ball.pos.x, this.tossApex, ball.pos.z);
@@ -731,8 +1190,7 @@ const Game = {
       apexRing.visible = false;
       if (q > 0.75) { this.perfects++; }
     }
-    SFX.pop(0.6 + q * 0.4, q > 0.75, panOf(ball.pos.x), side === FAR);
-    SFX.swing(0.6 + q * 0.4, panOf(r.pos.x), side === FAR);
+    SFX.pop(0.6 + q * 0.4, q > 0.75);
     camShake = Math.min(0.5, 0.2 + q * 0.3);
     if (q > 0.8) hitStop = 0.05;
     this.mode = 'rally';
@@ -789,7 +1247,6 @@ const Game = {
     $('rally').textContent = 'RALLY ' + this.rally;
     if (side === NEAR && [10, 16, 22].includes(this.rally)) {
       this.msg('RALLY ' + this.rally + '!', this.rally >= 16 ? 'unreal tennis' : 'the crowd is up', 1.0);
-      SFX.rallyCheer(this.rally);
     }
     // anim: forehand/backhand by ball side
     const onBackhand = (side === NEAR ? (ball.pos.x < rig.pos.x - 0.25) : (ball.pos.x > rig.pos.x + 0.25));
@@ -804,8 +1261,7 @@ const Game = {
         this.msg(q > 0.9 ? 'PERFECT!' : 'CRACKING SHOT!', Math.round(kmh) + ' km/h', 0.8);
       }
     }
-    SFX.pop(clamp(power * 0.7 + q * 0.5, 0.2, 1), q > 0.72, panOf(ball.pos.x), side === FAR);
-    SFX.swing(power, panOf(rig.pos.x), side === FAR);
+    SFX.pop(clamp(power * 0.7 + q * 0.5, 0.2, 1), q > 0.72);
     camShake = Math.min(0.6, 0.15 + (0.4 * power + 0.3 * q) * 0.5);
     if (q > 0.78 || power > 0.86) hitStop = 0.055;
     return true;
@@ -893,14 +1349,8 @@ function stepBall(dt) {
     ball.pos.addScaledVector(ball.vel, h);
     // net crossing (plane z=0)
     const prevZ = ball.pos.z - ball.vel.z * h;
-    if (!judging) {
-      if (ball.pos.y <= BALL_R && ball.vel.y < 0) {
-        if (ball.vel.y < -1.5) SFX.bounce(-ball.vel.y * 0.6, panOf(ball.pos.x), ball.pos.z < 0);
-        ball.pos.y = BALL_R; ball.vel.y *= -0.4; ball.vel.x *= 0.8; ball.vel.z *= 0.8;
-      }
-      continue;
-    }
-    if ((prevZ > 0) !== (ball.pos.z > 0) && Math.abs(ball.pos.x) < NET_HALF) {
+    if (!judging) { if (ball.pos.y <= BALL_R && ball.vel.y < 0) { ball.pos.y = BALL_R; ball.vel.y *= -0.4; ball.vel.x *= 0.8; ball.vel.z *= 0.8; } continue; }
+    if ((prevZ > 0) !== (ball.pos.z > 0) && Math.abs(ball.pos.x) < 6.6) {
       const t = Math.abs(ball.vel.z) > 0.01 ? prevZ / (prevZ - ball.pos.z) : 0.5;
       const yCross = (ball.pos.y - ball.vel.y * h) + ball.vel.y * h * t;
       if (yCross < netTopAt(ball.pos.x) + BALL_R && yCross > 0) {
@@ -909,7 +1359,6 @@ function stepBall(dt) {
         ball.vel.z *= -0.22; ball.vel.x *= 0.3; ball.vel.y *= 0.4;
         ball.netTouch = true;
         SFX.net();
-        camShake = Math.max(camShake, 0.12);
       }
     }
     // bounce — only hard impacts (or long-airborne drops) count for judging;
@@ -920,8 +1369,7 @@ function stepBall(dt) {
       ball.vel.y *= -0.72;
       ball.vel.x *= 0.86; ball.vel.z *= 0.86;
       if (Math.abs(ball.vel.y) < 1.1) ball.vel.y = 0;
-      if (impact > 1.2 || ball.airT > 0.3) { ball.airT = 0; onBounce(impact); }
-      else if (impact > 0.6) SFX.bounce(impact * 0.5, panOf(ball.pos.x), ball.pos.z < 0);
+      if (impact > 1.2 || ball.airT > 0.3) { ball.airT = 0; onBounce(); }
       if (!ball.live) return;
     }
   }
@@ -955,9 +1403,9 @@ function inServeBox(x, z, forSide) {
   if (Math.abs(x) > COURT.WS / 2) return false;
   return true;
 }
-function onBounce(impact = 8) {
+function onBounce() {
   if (!ball.live) return;
-  SFX.bounce(impact, panOf(ball.pos.x), ball.pos.z < 0);
+  SFX.bounce();
   ball.bounces++;
   const hitter = ball.lastHitter, foe = hitter === NEAR ? FAR : NEAR;
   if (hitter === 0) return;
@@ -1021,25 +1469,19 @@ function endRally(w, label) {
 // ---------- per-frame update ----------
 const clock = new THREE.Clock();
 let elapsed = 0;
-const panOf = x => clamp(x / 8, -0.9, 0.9);
-// shoe audio: footfalls on the gait cycle, squeaks on hard cuts and stops
-function footAudio(rig, far, dt) {
-  const sp = rig.vel.length();
-  rig.sqCool = Math.max(0, (rig.sqCool || 0) - dt);
-  const prev = rig.prevVel || (rig.prevVel = new THREE.Vector3());
-  const prevSp = prev.length();
-  if (rig.sqCool <= 0 && prevSp > 4.2) {
-    const cut = sp > 1 ? prev.dot(rig.vel) / (prevSp * sp) : 1;
-    if (cut < 0.2 || sp < prevSp - 3.2) { SFX.squeak(panOf(rig.pos.x), far); rig.sqCool = 0.45; }
-  }
-  const stepIdx = Math.floor(rig.phase / Math.PI);
-  if (sp > 2.2 && stepIdx !== rig.lastStep) SFX.step(panOf(rig.pos.x), far);
-  rig.lastStep = stepIdx;
-  prev.copy(rig.vel);
-}
+let gullT = rand(6, 12);
 function update(dt) {
   elapsed += dt;
-  updateScenery(elapsed);
+  skyMat.uniforms.uTime.value = elapsed;
+  skyMat.uniforms.uRes.value.set(renderer.domElement.width, renderer.domElement.height);
+  seaMat.uniforms.uTime.value = elapsed;
+  gullT -= dt;
+  if (gullT <= 0) { gullT = rand(12, 26); SFX.gull(); }
+  // lamp flicker (subtle)
+  for (const L of window.__lampLights) {
+    const f = 0.92 + Math.sin(elapsed * 7 + L.seed) * 0.03 + Math.sin(elapsed * 23 + L.seed * 2) * 0.02;
+    L.halo.material.opacity = 0.55 * f;
+  }
   // player movement (YOU)
   if (!Game.paused && (Game.mode === 'rally' || Game.mode === 'serve' || Game.mode === 'serve-pending')) {
     Input.poll();
@@ -1049,11 +1491,10 @@ function update(dt) {
     rig.vel.z = lerp(rig.vel.z, -Input.move.y * maxSp, clamp(acc * dt / maxSp, 0, 1));
     rig.pos.addScaledVector(rig.vel, dt);
     rig.pos.x = clamp(rig.pos.x, -6.8, 6.8);
-    rig.pos.z = clamp(rig.pos.z, 0.4, 14.2);
+    rig.pos.z = clamp(rig.pos.z, 0.4, 13.8);
     // charge grows while held
     if (Game.charging) {
       Game.charge = Math.min(1, Game.charge + dt / 0.85);
-      SFX.chargeSet(Game.charge);
       $('powerfill').style.width = (Game.charge * 100) + '%';
     }
   }
@@ -1068,11 +1509,11 @@ function update(dt) {
   rivalRig.update(dt, Game.paused ? 0 : rSp, ball.pos.x - rivalRig.pos.x, ball.pos.z - rivalRig.pos.z);
   playerRig.blob.position.y = 0.02 - playerRig.root.position.y;
   rivalRig.blob.position.y = 0.02 - rivalRig.root.position.y;
-  if (Game.mode !== 'menu') { footAudio(playerRig, false, dt); footAudio(rivalRig, true, dt); }
 
   // ball visuals
   ball.mesh.position.copy(ball.pos);
   ball.glow.position.copy(ball.pos);
+  ball.light.position.copy(ball.pos);
   const spd = ball.vel.length();
   const glowS = 0.26 + clamp(spd / 30, 0, 1) * 0.40;
   ball.glow.scale.set(glowS, glowS, 1);
@@ -1134,12 +1575,16 @@ function update(dt) {
     apexRing.material.opacity = 0.45 + q * 0.55;
   }
 
-  // camera stays locked to the plate; impact shake nudges the whole stage instead
+  // camera: gentle follow + shake, keeps reference framing
   camShake = Math.max(0, camShake - dt * 2.2);
-  if (camShake > 0.001) {
-    const k = camShake * 6;
-    stage.style.transform = `translate(${((Math.random() - 0.5) * k).toFixed(2)}px, ${((Math.random() - 0.5) * k * 0.7).toFixed(2)}px)`;
-  } else if (stage.style.transform) stage.style.transform = '';
+  const shx = (Math.random() - 0.5) * camShake * 0.5;
+  const shy = (Math.random() - 0.5) * camShake * 0.35;
+  camera.position.set(
+    CAM_BASE.x + clamp(ball.pos.x * 0.012 + playerRig.pos.x * 0.008, -0.22, 0.22) + shx,
+    CAM_BASE.y + shy,
+    CAM_BASE.z - camShake * 0.9
+  );
+  camera.lookAt(CAM_LOOK);
 }
 
 // ---------- main loop ----------
@@ -1148,7 +1593,6 @@ function loop() {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (hitStop > 0) hitStop = Math.max(0, hitStop - dt);
   else if (!Game.paused) update(dt);
-  else updateScenery(elapsed += dt);          // the sea keeps glittering while paused
   renderer.render(scene, camera);
 }
 
@@ -1159,9 +1603,6 @@ $('resumeBtn').onclick = () => Game.togglePause();
 $('quitBtn').onclick = () => { SFX.click(); Game.paused = false; $('pauseOv').classList.add('hidden'); Game.startMatch(); };
 $('pauseBtn').onclick = () => Game.togglePause();
 $('muteBtn').onclick = () => Game.toggleMute();
-$('musicBtn').onclick = () => Game.toggleMusic();
-$('muteBtn').textContent = SFX.muted ? '🔇' : '🔊';
-$('musicBtn').classList.toggle('off', !SFX.musicOn);
 $('helpBtn').onclick = () => { SFX.click(); $('helpOv').classList.remove('hidden'); };
 $('helpClose').onclick = () => { SFX.click(); $('helpOv').classList.add('hidden'); };
 Input.init();
@@ -1171,6 +1612,5 @@ if (QS.get('hud') === '0') document.body.classList.add('shot');
 if (QS.get('play') === '1') Game.startFromMenu();
 else document.body.classList.add('menu');
 window.__gameBooted = true;
-window.__seaside = { SFX, Game, ball, playerRig, rivalRig };   // debug handle for the console
 $('loader').classList.add('hidden');
 loop();

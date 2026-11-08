@@ -13,18 +13,12 @@
   html,body{width:100%;height:100%;overflow:hidden;background:#141031;
     font-family:"Segoe UI",system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif;
     color:#fff;touch-action:none;overscroll-behavior:none;user-select:none;-webkit-user-select:none}
-  /* the scene keeps the clip's 4:5 framing; the rest of the window is a soft
-     out-of-focus extension of the same plate (sky above, hedge below) */
-  #ambient{position:fixed;inset:0;z-index:0;overflow:hidden;
-    background:linear-gradient(to bottom,#6a5f9f 0%,#8a63a6 22%,#1f2a52 40%,#0b0f12 72%,#050806 100%)}
-  #ambient::before{content:"";position:absolute;inset:-8%;
-    background:url("assets/plate.jpg") center/cover no-repeat;filter:blur(38px) brightness(.62) saturate(1.1)}
-  #ambient::after{content:"";position:absolute;inset:0;
-    background:radial-gradient(ellipse at center,transparent 35%,rgba(4,3,12,.55) 100%)}
-  #stage{position:fixed;left:50%;top:50%;translate:-50% -50%;z-index:1;
-    box-shadow:0 0 80px rgba(0,0,0,.55);will-change:transform}
-  #game{position:absolute;inset:0}
+  #game{position:fixed;inset:0}
   #game canvas{display:block}
+  /* soft vignette + foreground bush darkening like the reference framing */
+  #vignette{position:fixed;inset:0;pointer-events:none;z-index:3;
+    background:radial-gradient(120% 90% at 50% 42%, transparent 58%, rgba(5,3,15,.2) 100%),
+               linear-gradient(to bottom, transparent 82%, rgba(4,6,8,.3) 100%)}
   /* fine film grain: gives the flat illustration its painterly tooth */
   #grain{position:fixed;inset:0;pointer-events:none;z-index:4;opacity:.04;mix-blend-mode:overlay;
     background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
@@ -108,8 +102,7 @@
   #endStats div{background:rgba(255,255,255,.06);border-radius:12px;padding:8px 14px;font-size:12px}
   #endStats b{display:block;font-size:20px;color:#c6ff4d}
   /* screenshot / cinematic mode: scene only, no HUD */
-  body.shot #hud, body.shot #touchUI{display:none}
-  #musicBtn.off{opacity:.45;text-decoration:line-through}
+  body.shot #hud, body.shot #vignette{display:none}
   /* small phones: keep the scoreboard clear of the icon buttons */
   @media (max-width:640px){
     #scoreboard{padding:6px 9px;gap:4px}
@@ -132,8 +125,8 @@ body.menu #hud { opacity: 0 !important; pointer-events: none; }
 </style>
 </head>
 <body>
-<div id="ambient"></div>
-<div id="stage"><div id="game"></div></div>
+<div id="game"></div>
+<div id="vignette"></div>
 <div id="grain"></div>
 
 <div id="hud">
@@ -144,7 +137,6 @@ body.menu #hud { opacity: 0 !important; pointer-events: none; }
   </div>
   <div id="stake"></div>
   <div id="topbtns">
-    <button class="iconbtn" id="musicBtn" title="Music (N)">🎵</button>
     <button class="iconbtn" id="muteBtn" title="Mute (M)">🔊</button>
     <button class="iconbtn" id="pauseBtn" title="Pause (P)">⏸</button>
     <button class="iconbtn" id="helpBtn" title="Help">?</button>
@@ -166,13 +158,12 @@ body.menu #hud { opacity: 0 !important; pointer-events: none; }
     <h1>SEASIDE SMASH</h1>
     <h2>TWILIGHT TENNIS · FIRST TO 3 GAMES</h2>
     <p>A rally under pink skies, by a glittering sea. Out-rally the rival silhouette in the most beautiful court on earth.</p>
-    <p style="opacity:.7;font-size:12px">🎧 best with headphones — surf, crickets &amp; a lo-fi score</p>
     <div class="keys" id="keysDesk">
       <b>← → ↑ ↓ / WASD</b><span>Move (aim your shot with movement as you strike)</span>
       <b>HOLD SPACE</b><span>Charge shot · release to smash (↑ deep · ↓ drop shot)</span>
       <b>K / L</b><span>Lob high &amp; deep</span>
       <b>SPACE ×2</b><span>Serve: toss, then strike near the peak</span>
-      <b>P · M · N</b><span>Pause · mute · music</span>
+      <b>P · M</b><span>Pause · mute</span>
     </div>
     <div class="keys" id="keysTouch" style="display:none">
       <b>LEFT DRAG</b><span>Virtual stick — run around your half</span>
